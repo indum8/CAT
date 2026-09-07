@@ -375,7 +375,353 @@ sed -n '190,196p' ~/cat/metadrive/engine/base_engine.py
 
 ---
 
-## 11. Data preparation — using the pre-packaged 500 scenarios
+## 11. `AttributeError: 'LVehicle' object has no attribute 'status'` — another stale object reference (further into the run)
+
+**Symptom:** After the Section 10 patch, the run progressed much further (168 of 500 scenarios, up from crashing at ~78 before) but then hit a related but distinct crash:
+
+```
+File "/home/<user>/cat/cat_advgen.py", line 53, in <module>
+    o, r, done, info = env.step([1.0, 0.]) # replace it with your own controller
+File "/home/<user>/cat/metadrive/envs/scenario_env.py", line 148, in step
+    ret = super(ScenarioEnv, self).step(actions)
+File "/home/<user>/cat/metadrive/envs/base_env.py", line 296, in step
+    engine_info = self._step_simulator(actions)
+File "/home/<user>/cat/metadrive/envs/base_env.py", line 326, in _step_simulator
+    scene_manager_after_step_infos = self.engine.after_step()
+File "/home/<user>/cat/metadrive/engine/base_engine.py", line 383, in after_step
+    new_step_info = manager.after_step(*args, **kwargs)
+File "/home/<user>/cat/metadrive/manager/agent_manager.py", line 264, in after_step
+    step_infos = self.for_each_active_agents(lambda v: v.after_step())
+File "/home/<user>/cat/metadrive/manager/agent_manager.py", line 425, in for_each_active_agents
+    ret[k] = func(v, *args, **kwargs)
+File "/home/<user>/cat/metadrive/manager/agent_manager.py", line 264, in <lambda>
+    step_infos = self.for_each_active_agents(lambda v: v.after_step())
+File "/home/<user>/cat/metadrive/component/vehicle/base_vehicle.py", line 322, in after_step
+    self._state_check()
+File "/home/<user>/cat/metadrive/component/vehicle/base_vehicle.py", line 828, in _state_check
+    if light.status == MetaDriveType.LIGHT_GREEN:
+AttributeError: 'LVehicle' object has no attribute 'status'
+```
+
+**Cause:** Same family of bug as Section 10 — a stale/mismatched object reference — but in a different code path. `BaseVehicle._state_check()` (in `metadrive/component/vehicle/base_vehicle.py`) runs physics contact detection each step. When a contact's collision node is named/tagged as `MetaDriveType.TRAFFIC_LIGHT`, the code calls `get_object_from_node(node)` expecting back a traffic-light object, then immediately accesses `.status` on it. Due to object ID recycling (the same underlying mechanism flagged in Section 10 — MetaDrive's object pooling in `BaseEngine.spawn_object()` reuses object slots/IDs across resets for efficiency), the node can end up bound to a *vehicle* object (`LVehicle`) instead of a light object by the time this check runs, which has no `.status` attribute.
+
+**Fix:** Add a defensive guard right after the lookup, following the same pattern already used elsewhere in this same function for other "didn't add, skip this contact" cases:
+
+```python
+# before
+elif name == MetaDriveType.TRAFFIC_LIGHT:
+    light = get_object_from_node(node)
+    if light.status == MetaDriveType.LIGHT_GREEN:
+        ...
+
+# after
+elif name == MetaDriveType.TRAFFIC_LIGHT:
+    light = get_object_from_node(node)
+    if not hasattr(light, "status"):
+        # Stale/mismatched object reference: node is tagged as TRAFFIC_LIGHT
+        # but the object currently bound to it is not a light (can happen
+        # due to object ID recycling between resets). Skip safely.
+        continue
+    if light.status == MetaDriveType.LIGHT_GREEN:
+        ...
+```
+
+This mirrors the existing `LIGHT_UNKNOWN` case a few lines below, which already uses `continue` to skip a contact that can't be meaningfully classified — so the fix is stylistically consistent with the surrounding code, not a new pattern being introduced.
+
+Applied via a small Python patch script (same reasoning as Section 10 — the target block spans multiple lines with specific indentation, which is more reliable to match exactly in Python than to construct as a `sed` one-liner):
+
+```bash
+cat > /tmp/patch_light_status.py << 'PYEOF'
+path = "/home/<user>/cat/metadrive/component/vehicle/base_vehicle.py"
+
+old = """            elif name == MetaDriveType.TRAFFIC_LIGHT:
+                light = get_object_from_node(node)
+                if light.status == MetaDriveType.LIGHT_GREEN:"""
+
+new = """            elif name == MetaDriveType.TRAFFIC_LIGHT:
+                light = get_object_from_node(node)
+                if not hasattr(light, "status"):
+                    # Stale/mismatched object reference: node is tagged as TRAFFIC_LIGHT
+                    # but the object currently bound to it is not a light (can happen
+                    # due to object ID recycling between resets). Skip safely.
+                    continue
+                if light.status == MetaDriveType.LIGHT_GREEN:"""
+
+with open(path) as f:
+    content = f.read()
+
+if old in content:
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("patched")
+else:
+    print("pattern not found")
+PYEOF
+python3 /tmp/patch_light_status.py
+```
+
+Verify:
+```bash
+sed -n '822,835p' ~/cat/metadrive/component/vehicle/base_vehicle.py
+```
+
+> **Note:** Like Section 10, this patches the fork-local copy of MetaDrive bundled with CAT. Reapply if you re-clone/re-download.
+
+> **Observation:** Both Sections 10 and 11 stem from the same root behavior (MetaDrive's object-recycling pool occasionally leaving stale ID-to-object bindings across scenario resets). If further runs surface additional `KeyError`/`AttributeError` crashes tied to object lookups (`get_object_from_node`, `_spawned_objects[...]`, etc.), the same "check before use, skip on mismatch" defensive pattern is the appropriate fix — search for other unguarded lookups of this shape rather than patching each occurrence reactively as it's hit.
+
+---
+
+## 12. `KeyError: '385'` — same unguarded-lookup bug, different call site (`get_objects()`)
+
+**Symptom:** Progressed further still (168/500 again, same point as Section 11's original crash) but with a different traceback, this time originating one call earlier:
+
+```
+File "/home/<user>/cat/metadrive/component/vehicle/base_vehicle.py", line 827, in _state_check
+    light = get_object_from_node(node)
+File "/home/<user>/cat/metadrive/utils/utils.py", line 191, in get_object_from_node
+    return get_object(ret)[ret]
+File "/home/<user>/cat/metadrive/engine/engine_utils.py", line 23, in get_object
+    return get_engine().get_objects([object_name])
+File "/home/<user>/cat/metadrive/engine/base_engine.py", line 164, in get_objects
+    return {id: self._spawned_objects[id] for id in filter}
+KeyError: '385'
+```
+
+**Cause:** `BaseEngine.get_objects()` (a sibling method to `clear_objects()`, which was already patched in Section 10) has the exact same unguarded dict-comprehension pattern:
+
+```python
+elif isinstance(filter, (list, tuple)):
+    return {id: self._spawned_objects[id] for id in filter}
+```
+
+This is called by `get_object()` (`engine_utils.py`), which is called by `get_object_from_node()` (`utils.py`), which is called by `BaseVehicle._state_check()` — the same call chain from Section 11, just failing one level deeper than the `hasattr` guard we'd already added there.
+
+**Fix:** Apply the same defensive pattern as Section 10's `clear_objects()` fix, this time to `get_objects()`:
+
+```python
+# before
+elif isinstance(filter, (list, tuple)):
+    return {id: self._spawned_objects[id] for id in filter}
+
+# after
+elif isinstance(filter, (list, tuple)):
+    return {id: self._spawned_objects[id] for id in filter if id in self._spawned_objects}
+```
+
+Applied the same way as previous patches (Python patch script for reliable multi-line matching):
+
+```bash
+cat > /tmp/patch_get_objects.py << 'PYEOF'
+path = "/home/<user>/cat/metadrive/engine/base_engine.py"
+
+old = """        elif isinstance(filter, (list, tuple)):
+            return {id: self._spawned_objects[id] for id in filter}
+        elif callable(filter):
+            res = dict()
+            for id, obj in self._spawned_objects.items():
+                if filter(obj):
+                    res[id] = obj
+            return res"""
+
+new = """        elif isinstance(filter, (list, tuple)):
+            return {id: self._spawned_objects[id] for id in filter if id in self._spawned_objects}
+        elif callable(filter):
+            res = dict()
+            for id, obj in self._spawned_objects.items():
+                if filter(obj):
+                    res[id] = obj
+            return res"""
+
+with open(path) as f:
+    content = f.read()
+
+if old in content:
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("patched")
+else:
+    print("pattern not found")
+PYEOF
+python3 /tmp/patch_get_objects.py
+```
+
+Verify:
+```bash
+sed -n '160,170p' ~/cat/metadrive/engine/base_engine.py
+```
+
+**Also worth noting:** at this point, `get_object_from_node()`'s final line (`return get_object(ret)[ret]`) was additionally hardened, so that if the ID isn't present in whatever `get_objects()` returns, it returns `None` (consistent with the early-return-`None` path already present earlier in that same function) rather than crashing on the `[ret]` index lookup:
+
+```python
+# before
+if is_road:
+    return get_engine().current_map.road_network.get_lane(ret)
+else:
+    return get_object(ret)[ret]
+
+# after
+if is_road:
+    return get_engine().current_map.road_network.get_lane(ret)
+else:
+    result = get_object(ret)
+    return result[ret] if ret in result else None
+```
+
+This second change ended up not being strictly necessary once `get_objects()` itself was fixed (since a fixed `get_objects()` never omits a requested-but-missing key from a dict in a way that would crash `[ret]`... actually it does, if `ret` isn't in the returned dict at all — so this guard is still meaningful defense-in-depth). Both patches were applied and kept.
+
+> **Note:** Fork-local patches — reapply if you re-clone/re-download the modified MetaDrive fork.
+
+---
+
+## 13. `AttributeError: 'NoneType' object has no attribute 'top_down_width'` — a fix regression, and why it happened
+
+**Symptom:** After Sections 10–12 resolved the MetaDrive-internal crashes, a new failure appeared in CAT's own code (not MetaDrive's):
+
+```
+File "/home/<user>/cat/cat_advgen.py", line 45, in <module>
+    adv_generator.before_episode(env)
+File "/home/<user>/cat/advgen/adv_generator.py", line 158, in before_episode
+    adv_info = dict(w=adv_obj.top_down_width,l=adv_obj.top_down_length),
+AttributeError: 'NoneType' object has no attribute 'top_down_width'
+```
+
+**Cause — this one is a regression introduced by our own Section 12 fix, worth understanding clearly:**
+
+The original code in `advgen/adv_generator.py` was:
+```python
+ego_obj = self.env.engine.get_objects(['default_agent']).get('default_agent')
+try:
+    adv_obj = self.env.engine.get_objects([adv_agent]).get(adv_agent)
+except:
+    adv_obj = ego_obj
+```
+
+The intent is clear: if the designated opponent vehicle (`adv_agent`) doesn't exist for this scenario, fall back to using the ego vehicle's info instead of crashing. **Before Section 12's fix**, `get_objects()` raised a `KeyError` when asked for a nonexistent ID — and that `KeyError` was exactly what this `try/except` was designed to catch, triggering the fallback.
+
+**After Section 12's fix**, `get_objects()` was changed to silently omit missing IDs and return a dict without them, rather than raising. This was the correct fix for the crash it targeted — but it had a side effect here: `.get(adv_agent)` on the (now silently incomplete) returned dict just returns `None` — no exception is raised, so the `except:` block never triggers, and the intended fallback never happens. `adv_obj` stays `None`, causing this crash.
+
+This is a good illustration of why defensive patches to shared utility functions can have non-local effects — fixing one call site's crash-on-missing-key behavior can silently change the behavior of every other caller that happened to rely on the old crash-then-catch pattern.
+
+**Fix:** Make the fallback explicit, checking for `None` directly instead of depending on an exception that no longer occurs:
+
+```python
+# before
+ego_obj = self.env.engine.get_objects(['default_agent']).get('default_agent')
+try:
+    adv_obj = self.env.engine.get_objects([adv_agent]).get(adv_agent)
+except:
+    adv_obj = ego_obj
+
+# after
+ego_obj = self.env.engine.get_objects(['default_agent']).get('default_agent')
+adv_obj = self.env.engine.get_objects([adv_agent]).get(adv_agent)
+if adv_obj is None:
+    # Opponent vehicle not present for this scenario (or a stale/
+    # missing object reference) -- fall back to the ego vehicle's
+    # info, matching the original try/except's intended behavior.
+    adv_obj = ego_obj
+```
+
+Applied via patch script:
+```bash
+cat > /tmp/patch_adv_obj_fallback.py << 'PYEOF'
+path = "/home/<user>/cat/advgen/adv_generator.py"
+
+old = """            ego_obj = self.env.engine.get_objects(['default_agent']).get('default_agent')
+            try:
+                adv_obj = self.env.engine.get_objects([adv_agent]).get(adv_agent)
+            except:
+                adv_obj = ego_obj"""
+
+new = """            ego_obj = self.env.engine.get_objects(['default_agent']).get('default_agent')
+            adv_obj = self.env.engine.get_objects([adv_agent]).get(adv_agent)
+            if adv_obj is None:
+                # Opponent vehicle not present for this scenario (or a stale/
+                # missing object reference) -- fall back to the ego vehicle's
+                # info, matching the original try/except's intended behavior.
+                adv_obj = ego_obj"""
+
+with open(path) as f:
+    content = f.read()
+
+if old in content:
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("patched")
+else:
+    print("pattern not found")
+PYEOF
+python3 /tmp/patch_adv_obj_fallback.py
+```
+
+Verify:
+```bash
+sed -n '146,158p' ~/cat/advgen/adv_generator.py
+```
+
+> **Lesson for future patching:** when changing a shared utility's error-handling behavior (raise → silent skip, or vice versa), grep for other callers of that utility that use `try/except` around it — they may depend on the exception being raised, and will need the same "check explicitly instead of relying on the exception" treatment.
+
+---
+
+## 14. Recurring session-scoped environment loss (`CUDA_VISIBLE_DEVICES`, `DISPLAY`)
+
+**Symptom:** After a fresh SSH reconnect, both of the following regressed even though they'd been fixed earlier in the same overall setup:
+- The CUDA/Blackwell crash from Section 6 recurred (`RuntimeError: CUDA error: no kernel image is available for execution on the device`), because `export CUDA_VISIBLE_DEVICES=""` only applies to the shell session it was run in.
+- The Xvfb/display crash from Section 9 recurred (`pygame.error: No available video device`), because the backgrounded `Xvfb :99 ...` process either wasn't still running, or `$DISPLAY` wasn't set in the new session.
+
+**Fix — make `CUDA_VISIBLE_DEVICES` persistent to the conda environment itself** (rather than the shell), so it's automatically set every time `conda activate cat` runs, on any future session:
+
+```bash
+conda activate cat
+conda env config vars set CUDA_VISIBLE_DEVICES=""
+conda deactivate
+conda activate cat
+```
+
+Verify:
+```bash
+echo $CUDA_VISIBLE_DEVICES   # should print an empty line
+python -c "import torch; print(torch.cuda.is_available())"   # should print False
+```
+
+**For Xvfb**, there's no equivalent "attach to conda env" trick — a background process doesn't survive an SSH session ending unless it's detached properly (e.g. run inside `screen`/`tmux`, or with `nohup ... &` and `disown`). At minimum, check and restart per-session as needed:
+```bash
+ps aux | grep -i xvfb
+# if nothing shown:
+Xvfb :99 -screen 0 1400x900x24 &
+export DISPLAY=:99
+```
+
+For a long training/generation run you plan to leave running unattended, it's worth starting both the Xvfb process and the actual `python cat_advgen.py` run inside a `tmux` or `screen` session, so neither depends on the SSH connection staying alive:
+```bash
+tmux new -s cat_run
+# inside tmux:
+conda activate cat
+Xvfb :99 -screen 0 1400x900x24 &
+export DISPLAY=:99
+python cat_advgen.py
+# detach with Ctrl+B then D; reattach later with: tmux attach -t cat_run
+```
+
+---
+
+## 15. Considered but not used: upgrading to a Blackwell-native PyTorch (CUDA path)
+
+For completeness, since GPU acceleration was considered as an alternative to the CPU-only approach used throughout this document:
+
+- **PyTorch 2.7.0** was the first stable release with native `sm_120` (Blackwell) support, via pre-built CUDA 12.8 wheels (with updated cuDNN, NCCL, and Triton). PyTorch 2.11.0 is the current recommended stable version supporting Blackwell as of this writing.
+- **Decision: not pursued.** CAT's code (`advgen/modeling/vectornet.py`, `adv_generator.py`, etc.) is written against torch 1.12.0's API, a jump of several major versions. Concrete known risks if upgrading:
+  - `torchvision.models(pretrained=True)` — already seen as a deprecation warning on this setup — is removed entirely in torchvision 0.15+, which would ship alongside a modern torch 2.x.
+  - `torch.load()`'s default `weights_only` behavior changed in newer torch versions, which can silently break loading older-format checkpoints like `densetnt.bin` unless handled explicitly.
+  - Potential further NumPy 2.0-related incompatibilities, compounding the existing `gym`/NumPy 2.0 warning already present in this stack.
+- Given the CPU-only path was already working end-to-end (Section 16 confirms a full clean run), the safer choice was made to stay on CPU rather than risk introducing new, harder-to-diagnose breakage for a speed gain. If pursuing GPU acceleration later, treat it as an isolated follow-up effort with its own testing pass — not a drop-in swap.
+
+---
+
+## 16. Data preparation — using the pre-packaged 500 scenarios
 
 CAT provides 500 pre-processed Waymo Open Motion Dataset (WOMD) v1.1 scenarios so you don't need to run the full tfrecord conversion pipeline (`scripts/covert_WOMD_to_MD.py` + `scripts/select_cases.py`) to get started.
 
@@ -397,9 +743,9 @@ CAT provides 500 pre-processed Waymo Open Motion Dataset (WOMD) v1.1 scenarios s
 
 ---
 
-## 12. Final working setup
+## 17. Final working setup
 
-Once all the above was applied, `python cat_advgen.py` ran successfully end-to-end (CPU-only, with a virtual display for the top-down renderer), producing output including successful episode completions (`Episode ended! Reason: arrive_dest.`) and scenario-loop progress.
+Once all the above was applied, `python cat_advgen.py` completed a **full, clean 500/500 scenario run** (CPU-only, with a virtual display for the top-down renderer), finishing in ~31 minutes with a final `avg_attack_success_rate=0.9` and `avg_compute_time=0.358`s per scenario — no crashes, no hangs, no manual intervention mid-run.
 
 ### Summary of environment
 - Ubuntu 26.04 LTS ("resolute")
@@ -411,13 +757,19 @@ Once all the above was applied, `python cat_advgen.py` ran successfully end-to-e
 - `pickle5` installed directly (worked fine on this Python 3.9 build)
 - Xvfb virtual display on `:99` for the top-down pygame renderer
 - 500 pre-packaged WOMD scenarios placed at `~/cat/raw_scenes_500/`
-- One-line defensive patch in `metadrive/engine/base_engine.py`'s `clear_objects()` to skip stale object IDs during scenario reset (Section 10)
+- Four defensive patches in the fork-local MetaDrive/CAT copy for object-lifecycle edge cases:
+  - `metadrive/engine/base_engine.py`'s `clear_objects()` (Section 10)
+  - `metadrive/component/vehicle/base_vehicle.py`'s `_state_check()` (Section 11)
+  - `metadrive/engine/base_engine.py`'s `get_objects()` + `metadrive/utils/utils.py`'s `get_object_from_node()` (Section 12)
+  - `advgen/adv_generator.py`'s `before_episode()` opponent-vehicle fallback (Section 13 — a regression fix for Section 12's own side effect)
+- `CUDA_VISIBLE_DEVICES=""` made persistent to the `cat` conda environment (Section 14), rather than relying on a per-session `export`
 
 ### Known limitations of this setup
-- **CPU-only inference/training.** DenseTNT inference and MetaDrive physics both run in software. This works but is significantly slower than the GPU numbers reported in the CAT paper. If GPU acceleration is needed, the real fix is upgrading to a PyTorch build with Blackwell (`sm_120`) support (PyTorch 2.x + CUDA 12.4+ minimum) — but this risks breaking CAT's code against deprecated/changed APIs (e.g. `torchvision.models` `pretrained=True` deprecation warnings already observed) and would need its own testing pass.
-- **The `clear_objects()` patch (Section 10) is local to this checkout.** If you re-download the modified MetaDrive fork fresh, or clone CAT again elsewhere, you'll need to reapply it.
+- **CPU-only inference/training, by choice.** DenseTNT inference and MetaDrive physics both run in software. A CUDA path exists (PyTorch 2.7+ supports Blackwell natively — see Section 15) but was deliberately not pursued, to avoid risking breakage in CAT's torch-1.12-era code for a speed gain. The CPU path is fully confirmed working end-to-end.
+- **The fork-local patches (Sections 10–13) are local to this checkout.** If you re-download the modified MetaDrive fork fresh, or clone CAT again elsewhere, you'll need to reapply all four.
+- **Sessions are not self-healing.** `CUDA_VISIBLE_DEVICES` is now persistent to the conda environment (Section 14), but Xvfb/`$DISPLAY` still needs to be checked/restarted per SSH session unless run inside `tmux`/`screen` (recommended for any long unattended run — see Section 14).
 - The `deadsnakes`/`venv` route was explored but not used in the final setup — documented here in case conda is undesirable in your environment.
-- This document reflects the setup working through the point of a full 500-scenario `cat_advgen.py` run being unblocked (all known crashes resolved through scenario ~78+, with the underlying cause of the last crash fixed at its root, not merely worked around for that one scenario). Update this section once you've confirmed a complete, uninterrupted 500/500 run end-to-end.
+- **Confirmed working end-to-end:** a complete, uninterrupted 500/500 scenario run via `python cat_advgen.py` was achieved on this setup (~31 minutes, `avg_attack_success_rate=0.9`).
 
 ---
 
@@ -478,6 +830,22 @@ export DISPLAY=:99
 # 13. Patch metadrive/engine/base_engine.py's clear_objects() to skip
 #     stale object IDs during scenario reset (see Section 10 for exact diff)
 
-# 14. Run
+# 14. Patch metadrive/component/vehicle/base_vehicle.py's _state_check()
+#     to skip stale/mismatched traffic-light object references
+#     (see Section 11 for exact diff)
+
+# 15. Patch metadrive/engine/base_engine.py's get_objects() and
+#     metadrive/utils/utils.py's get_object_from_node() the same way
+#     (see Section 12 for exact diffs)
+
+# 16. Patch advgen/adv_generator.py's before_episode() opponent-vehicle
+#     fallback, which broke as a side effect of step 15's fix
+#     (see Section 13 for exact diff)
+
+# 17. Make CUDA_VISIBLE_DEVICES persistent to the conda env (see Section 14):
+conda env config vars set CUDA_VISIBLE_DEVICES=""
+conda deactivate && conda activate cat
+
+# 18. Run (confirmed: completes a full 500/500 scenario run, ~31 min)
 python cat_advgen.py
 ```
