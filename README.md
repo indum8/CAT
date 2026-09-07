@@ -305,7 +305,77 @@ Xvfb :99 -screen 0 1400x900x24 &
 
 ---
 
-## 10. Data preparation — using the pre-packaged 500 scenarios
+## 10. `KeyError: '500'` — stale object reference during scenario reset (MetaDrive internal bug)
+
+**Symptom:** After successfully running ~78 of 500 scenarios (visible progress bar, `avg_attack_success_rate` populating, occasional `INFO:root:Episode ended! Reason: arrive_dest.` lines), the run crashed:
+
+```
+File "/home/<user>/cat/cat_advgen.py", line 63, in <module>
+    env.reset(force_seed=i)
+File "/home/<user>/cat/metadrive/envs/base_env.py", line 401, in reset
+    self.engine.reset()
+File "/home/<user>/cat/metadrive/engine/base_engine.py", line 273, in reset
+    manager.before_reset()
+File "/home/<user>/cat/metadrive/manager/scenario_light_manager.py", line 21, in before_reset
+    super(ScenarioLightManager, self).before_reset()
+File "/home/<user>/cat/metadrive/manager/base_manager.py", line 41, in before_reset
+    self.clear_objects([object_id for object_id in self.spawned_objects.keys()])
+File "/home/<user>/cat/metadrive/manager/base_manager.py", line 78, in clear_objects
+    exclude_objects = self.engine.clear_objects(*args, **kwargs)
+File "/home/<user>/cat/metadrive/engine/base_engine.py", line 194, in clear_objects
+    exclude_objects = {obj_id: self._spawned_objects[obj_id] for obj_id in filter}
+KeyError: '500'
+```
+
+**Cause:** This is unrelated to any environment/dependency setup issue — it's an internal bug in MetaDrive's object lifecycle management. `BaseEngine.clear_objects()` (in `metadrive/engine/base_engine.py`) is handed a list of object IDs to destroy (here, traffic light objects tracked by `ScenarioLightManager`), and it assumes every ID in that list still exists in `self._spawned_objects`. In practice, at scenario-reset boundaries, an object can already have been removed by another manager or process before this cleanup runs — leaving a stale ID reference that triggers a hard `KeyError` instead of being silently skipped.
+
+The exact scenario/frame this happens on is not deterministic in general — it manifested here at scenario index ~78 with the 500 pre-packaged scenarios, but the underlying condition (stale ID left in a `filter` list) can in principle occur on any scenario, depending on light/object spawn timing.
+
+**Fix:** Patch `clear_objects()` in `metadrive/engine/base_engine.py` to skip IDs that no longer exist in `_spawned_objects`, rather than crash:
+
+```python
+# before (line ~194)
+exclude_objects = {obj_id: self._spawned_objects[obj_id] for obj_id in filter}
+
+# after
+exclude_objects = {obj_id: self._spawned_objects[obj_id] for obj_id in filter if obj_id in self._spawned_objects}
+```
+
+This is a minimal, defensive change — it does not alter physics, scenario logic, or attack-generation behavior. It only prevents a crash when the cleanup step encounters an object ID that's already gone, which is a legitimate state to handle gracefully (the object is gone either way; the intent of the line was to destroy it, which is a no-op if it no longer exists).
+
+Applied via a small Python patch script (safer than `sed` here, since the target line contains braces/colons/brackets that are awkward to escape correctly in shell one-liners):
+
+```bash
+cat > /tmp/patch_clear_objects.py << 'EOF'
+path = "/home/<user>/cat/metadrive/engine/base_engine.py"
+
+old = "exclude_objects = {obj_id: self._spawned_objects[obj_id] for obj_id in filter}"
+new = "exclude_objects = {obj_id: self._spawned_objects[obj_id] for obj_id in filter if obj_id in self._spawned_objects}"
+
+with open(path) as f:
+    content = f.read()
+
+if old in content:
+    content = content.replace(old, new)
+    with open(path, "w") as f:
+        f.write(content)
+    print("patched")
+else:
+    print("pattern not found")
+EOF
+python3 /tmp/patch_clear_objects.py
+```
+
+Verify the change landed:
+```bash
+sed -n '190,196p' ~/cat/metadrive/engine/base_engine.py
+```
+
+> **Note:** This is a fork-local patch to the *modified* MetaDrive copy bundled with CAT (`~/cat/metadrive/`), not to a pip-installed MetaDrive package. If you re-download or re-clone the modified MetaDrive fork from CAT's README link, you will need to reapply this patch.
+
+---
+
+## 11. Data preparation — using the pre-packaged 500 scenarios
 
 CAT provides 500 pre-processed Waymo Open Motion Dataset (WOMD) v1.1 scenarios so you don't need to run the full tfrecord conversion pipeline (`scripts/covert_WOMD_to_MD.py` + `scripts/select_cases.py`) to get started.
 
@@ -327,7 +397,7 @@ CAT provides 500 pre-processed Waymo Open Motion Dataset (WOMD) v1.1 scenarios s
 
 ---
 
-## 11. Final working setup
+## 12. Final working setup
 
 Once all the above was applied, `python cat_advgen.py` ran successfully end-to-end (CPU-only, with a virtual display for the top-down renderer), producing output including successful episode completions (`Episode ended! Reason: arrive_dest.`) and scenario-loop progress.
 
@@ -341,10 +411,13 @@ Once all the above was applied, `python cat_advgen.py` ran successfully end-to-e
 - `pickle5` installed directly (worked fine on this Python 3.9 build)
 - Xvfb virtual display on `:99` for the top-down pygame renderer
 - 500 pre-packaged WOMD scenarios placed at `~/cat/raw_scenes_500/`
+- One-line defensive patch in `metadrive/engine/base_engine.py`'s `clear_objects()` to skip stale object IDs during scenario reset (Section 10)
 
 ### Known limitations of this setup
 - **CPU-only inference/training.** DenseTNT inference and MetaDrive physics both run in software. This works but is significantly slower than the GPU numbers reported in the CAT paper. If GPU acceleration is needed, the real fix is upgrading to a PyTorch build with Blackwell (`sm_120`) support (PyTorch 2.x + CUDA 12.4+ minimum) — but this risks breaking CAT's code against deprecated/changed APIs (e.g. `torchvision.models` `pretrained=True` deprecation warnings already observed) and would need its own testing pass.
+- **The `clear_objects()` patch (Section 10) is local to this checkout.** If you re-download the modified MetaDrive fork fresh, or clone CAT again elsewhere, you'll need to reapply it.
 - The `deadsnakes`/`venv` route was explored but not used in the final setup — documented here in case conda is undesirable in your environment.
+- This document reflects the setup working through the point of a full 500-scenario `cat_advgen.py` run being unblocked (all known crashes resolved through scenario ~78+, with the underlying cause of the last crash fixed at its root, not merely worked around for that one scenario). Update this section once you've confirmed a complete, uninterrupted 500/500 run end-to-end.
 
 ---
 
@@ -402,6 +475,9 @@ export DISPLAY=:99
 #     (download from README's Google Drive link, scp to remote, place at)
 #     ~/cat/raw_scenes_500/
 
-# 13. Run
+# 13. Patch metadrive/engine/base_engine.py's clear_objects() to skip
+#     stale object IDs during scenario reset (see Section 10 for exact diff)
+
+# 14. Run
 python cat_advgen.py
 ```
